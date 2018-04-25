@@ -7,6 +7,8 @@
 #ifndef XGBOOST_TREE_FAST_HIST_PARAM_H_
 #define XGBOOST_TREE_FAST_HIST_PARAM_H_
 
+#include <string>
+
 namespace xgboost {
 namespace tree {
 
@@ -29,6 +31,7 @@ struct FastHistParam : public dmlc::Parameter<FastHistParam> {
   // for that feature; to save time, only up to (max_search_group) of existing groups
   // will be considered. If set to zero, ALL existing groups will be examined
   unsigned max_search_group;
+  std::string omega_term;
 
   // declare the parameters
   DMLC_DECLARE_PARAMETER(FastHistParam) {
@@ -55,6 +58,8 @@ struct FastHistParam : public dmlc::Parameter<FastHistParam> {
                   "groups before creating a new group for that feature; to save time, "
                   "only up to (max_search_group) of existing groups will be "
                   "considered. If set to zero, ALL existing groups will be examined.");
+    DMLC_DECLARE_FIELD(omega_term).set_default("weight_decay")
+        .describe("The Omega term that should be used to regularise the treee.");
   }
 };
 

@@ -22,6 +22,8 @@
 #include "../common/row_set.h"
 #include "../common/column_matrix.h"
 
+#include <xgboost/tree_omega_term.h>
+
 namespace xgboost {
 namespace tree {
 
@@ -54,6 +56,8 @@ class FastHistMaker: public TreeUpdater {
     param_.InitAllowUnknown(args);
     fhparam_.InitAllowUnknown(args);
     is_gmat_initialized_ = false;
+    omega_.reset(TreeOmegaTerm::Create(fhparam_.omega_term));
+    omega_->Init(args);
   }
 
   void Update(HostDeviceVector<GradientPair>* gpair,
@@ -80,7 +84,7 @@ class FastHistMaker: public TreeUpdater {
     TConstraint::Init(&param_, dmat->Info().num_col_);
     // build tree
     if (!builder_) {
-      builder_.reset(new Builder(param_, fhparam_, std::move(pruner_)));
+      builder_.reset(new Builder(param_, fhparam_, std::move(pruner_), std::move(omega_)));
     }
     for (auto tree : trees) {
       builder_->Update
@@ -134,9 +138,12 @@ class FastHistMaker: public TreeUpdater {
     // constructor
     explicit Builder(const TrainParam& param,
                      const FastHistParam& fhparam,
-                     std::unique_ptr<TreeUpdater> pruner)
+                     std::unique_ptr<TreeUpdater> pruner,
+                     std::unique_ptr<TreeOmegaTerm> omega
+                     )
       : param_(param), fhparam_(fhparam), pruner_(std::move(pruner)),
-        p_last_tree_(nullptr), p_last_fmat_(nullptr) {}
+        p_last_tree_(nullptr), p_last_fmat_(nullptr), omega_(std::move(omega)) {}
+
     // update one tree, growing
     virtual void Update(const GHistIndexMatrix& gmat,
                         const GHistIndexBlockMatrix& gmatb,
@@ -814,9 +821,9 @@ class FastHistMaker: public TreeUpdater {
       // calculating the weights
       {
         snode_[nid].root_gain = static_cast<float>(
-            constraints_[nid].CalcGain(param_, snode_[nid].stats));
+            omega_->CalcGain(snode_[nid].stats));
         snode_[nid].weight = static_cast<float>(
-            constraints_[nid].CalcWeight(param_, snode_[nid].stats));
+            omega_->CalcWeight(snode_[nid].stats));
       }
     }
 
@@ -872,13 +879,13 @@ class FastHistMaker: public TreeUpdater {
             if (d_step > 0) {
               // forward enumeration: split at right bound of each bin
               loss_chg = static_cast<bst_float>(
-                  constraint.CalcSplitGain(param_, param_.monotone_constraints[fid], e, c) -
+                  omega_->CalcSplitGain(e, c) -
                   snode.root_gain);
               split_pt = cut_val[i];
             } else {
               // backward enumeration: split at left bound of each bin
               loss_chg = static_cast<bst_float>(
-                  constraint.CalcSplitGain(param_, param_.monotone_constraints[fid], c, e) -
+                  omega_->CalcSplitGain(c, e) -
                   snode.root_gain);
               if (i == imin) {
                 // for leftmost bin, left bound is the smallest feature value
@@ -949,6 +956,7 @@ class FastHistMaker: public TreeUpdater {
 
     // constraint value
     std::vector<TConstraint> constraints_;
+    std::unique_ptr<TreeOmegaTerm> omega_;
 
     using ExpandQueue =
         std::priority_queue<ExpandEntry, std::vector<ExpandEntry>,
@@ -961,6 +969,7 @@ class FastHistMaker: public TreeUpdater {
 
   std::unique_ptr<Builder> builder_;
   std::unique_ptr<TreeUpdater> pruner_;
+  std::unique_ptr<TreeOmegaTerm> omega_;
 };
 
 // simple switch to defer implementation.
