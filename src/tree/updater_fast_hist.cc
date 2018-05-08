@@ -44,7 +44,6 @@ DMLC_REGISTRY_FILE_TAG(updater_fast_hist);
 DMLC_REGISTER_PARAMETER(FastHistParam);
 
 /*! \brief construct a tree using quantized feature values */
-template<typename TStats, typename TConstraint>
 class FastHistMaker: public TreeUpdater {
  public:
   void Init(const std::vector<std::pair<std::string, std::string> >& args) override {
@@ -63,7 +62,7 @@ class FastHistMaker: public TreeUpdater {
   void Update(HostDeviceVector<GradientPair>* gpair,
               DMatrix* dmat,
               const std::vector<RegTree*>& trees) override {
-    TStats::CheckInfo(dmat->Info());
+    GradStats::CheckInfo(dmat->Info());
     if (is_gmat_initialized_ == false) {
       double tstart = dmlc::GetTime();
       hmat_.Init(dmat, static_cast<uint32_t>(param_.max_bin));
@@ -81,7 +80,6 @@ class FastHistMaker: public TreeUpdater {
     // rescale learning rate according to size of trees
     float lr = param_.learning_rate;
     param_.learning_rate = lr / trees.size();
-    TConstraint::Init(&param_, dmat->Info().num_col_);
     // build tree
     if (!builder_) {
       builder_.reset(new Builder(param_, fhparam_, std::move(pruner_), std::move(omega_)));
@@ -119,7 +117,7 @@ class FastHistMaker: public TreeUpdater {
   // data structure
   struct NodeEntry {
     /*! \brief statics for node entry */
-    TStats stats;
+    GradStats stats;
     /*! \brief loss of this node, without split */
     bst_float root_gain;
     /*! \brief weight calculated related to current data */
@@ -490,9 +488,9 @@ class FastHistMaker: public TreeUpdater {
       for (bst_omp_uint i = 0; i < nfeature; ++i) {
         const bst_uint fid = feat_set[i];
         const unsigned tid = omp_get_thread_num();
-        this->EnumerateSplit(-1, gmat, hist[nid], snode_[nid], constraints_[nid], info,
+        this->EnumerateSplit(-1, gmat, hist[nid], snode_[nid], info,
           &best_split_tloc_[tid], fid);
-        this->EnumerateSplit(+1, gmat, hist[nid], snode_[nid], constraints_[nid], info,
+        this->EnumerateSplit(+1, gmat, hist[nid], snode_[nid], info,
           &best_split_tloc_[tid], fid);
       }
       for (unsigned tid = 0; tid < nthread; ++tid) {
@@ -636,75 +634,6 @@ class FastHistMaker: public TreeUpdater {
       }
     }
 
-    inline void ApplySplitSparseDataOld(const RowSetCollection::Elem rowset,
-                                        const GHistIndexMatrix& gmat,
-                                        std::vector<RowSetCollection::Split>* p_row_split_tloc,
-                                        bst_uint lower_bound,
-                                        bst_uint upper_bound,
-                                        bst_int split_cond,
-                                        bool default_left) {
-      std::vector<RowSetCollection::Split>& row_split_tloc = *p_row_split_tloc;
-      constexpr int kUnroll = 8;  // loop unrolling factor
-      const size_t nrows = rowset.end - rowset.begin;
-      const size_t rest = nrows % kUnroll;
-      #pragma omp parallel for num_threads(nthread_) schedule(static)
-      for (bst_omp_uint i = 0; i < nrows - rest; i += kUnroll) {
-        size_t rid[kUnroll];
-        GHistIndexRow row[kUnroll];
-        const uint32_t* p[kUnroll];
-        bst_uint tid = omp_get_thread_num();
-        auto& left = row_split_tloc[tid].left;
-        auto& right = row_split_tloc[tid].right;
-        for (int k = 0; k < kUnroll; ++k) {
-          rid[k] = rowset.begin[i + k];
-        }
-        for (int k = 0; k < kUnroll; ++k) {
-          row[k] = gmat[rid[k]];
-        }
-        for (int k = 0; k < kUnroll; ++k) {
-          p[k] = std::lower_bound(row[k].index, row[k].index + row[k].size, lower_bound);
-        }
-        for (int k = 0; k < kUnroll; ++k) {
-          if (p[k] != row[k].index + row[k].size && *p[k] < upper_bound) {
-            CHECK_LT(*p[k],
-              static_cast<uint32_t>(std::numeric_limits<int32_t>::max()));
-            if (static_cast<int32_t>(*p[k]) <= split_cond) {
-              left.push_back(rid[k]);
-            } else {
-              right.push_back(rid[k]);
-            }
-          } else {
-            if (default_left) {
-              left.push_back(rid[k]);
-            } else {
-              right.push_back(rid[k]);
-            }
-          }
-        }
-      }
-      for (size_t i = nrows - rest; i < nrows; ++i) {
-        const size_t rid = rowset.begin[i];
-        const auto row = gmat[rid];
-        const auto p = std::lower_bound(row.index, row.index + row.size, lower_bound);
-        auto& left = row_split_tloc[0].left;
-        auto& right = row_split_tloc[0].right;
-        if (p != row.index + row.size && *p < upper_bound) {
-          CHECK_LT(*p, static_cast<uint32_t>(std::numeric_limits<int32_t>::max()));
-          if (static_cast<int32_t>(*p) <= split_cond) {
-            left.push_back(rid);
-          } else {
-            right.push_back(rid);
-          }
-        } else {
-          if (default_left) {
-            left.push_back(rid);
-          } else {
-            right.push_back(rid);
-          }
-        }
-      }
-    }
-
     template<typename T>
     inline void ApplySplitSparseData(const RowSetCollection::Elem rowset,
                                     const GHistIndexMatrix& gmat,
@@ -783,10 +712,8 @@ class FastHistMaker: public TreeUpdater {
                             const RegTree& tree) {
       {
         snode_.resize(tree.param.num_nodes, NodeEntry(param_));
-        constraints_.resize(tree.param.num_nodes);
       }
 
-      // setup constraints before calculating the weight
       {
         auto& stats = snode_[nid].stats;
         if (data_layout_ == kDenseDataZeroBased || data_layout_ == kDenseDataOneBased) {
@@ -808,14 +735,6 @@ class FastHistMaker: public TreeUpdater {
             stats.Add(gpair[*it]);
           }
         }
-        if (!tree[nid].IsRoot()) {
-          const int pid = tree[nid].Parent();
-          constraints_[pid].SetChild(param_, tree[pid].SplitIndex(),
-                                     snode_[tree[pid].LeftChild()].stats,
-                                     snode_[tree[pid].RightChild()].stats,
-                                     &constraints_[tree[pid].LeftChild()],
-                                     &constraints_[tree[pid].RightChild()]);
-        }
       }
 
       // calculating the weights
@@ -832,7 +751,6 @@ class FastHistMaker: public TreeUpdater {
                                const GHistIndexMatrix& gmat,
                                const GHistRow& hist,
                                const NodeEntry& snode,
-                               const TConstraint& constraint,
                                const MetaInfo& info,
                                SplitEntry* p_best,
                                bst_uint fid) {
@@ -843,8 +761,8 @@ class FastHistMaker: public TreeUpdater {
       const std::vector<bst_float>& cut_val = gmat.cut->cut;
 
       // statistics on both sides of split
-      TStats c(param_);
-      TStats e(param_);
+      GradStats c(param_);
+      GradStats e(param_);
       // best split so far
       SplitEntry best;
 
@@ -954,8 +872,7 @@ class FastHistMaker: public TreeUpdater {
     const RegTree* p_last_tree_;
     const DMatrix* p_last_fmat_;
 
-    // constraint value
-    std::vector<TConstraint> constraints_;
+    // regularization term
     std::unique_ptr<TreeOmegaTerm> omega_;
 
     using ExpandQueue =
@@ -972,45 +889,10 @@ class FastHistMaker: public TreeUpdater {
   std::unique_ptr<TreeOmegaTerm> omega_;
 };
 
-// simple switch to defer implementation.
-class FastHistTreeUpdaterSwitch : public TreeUpdater {
- public:
-  FastHistTreeUpdaterSwitch()  = default;
-  void Init(const std::vector<std::pair<std::string, std::string> >& args) override {
-    for (auto &kv : args) {
-      if (kv.first == "monotone_constraints" && kv.second.length() != 0) {
-        monotone_ = true;
-      }
-    }
-    if (inner_ == nullptr) {
-      if (monotone_) {
-        inner_.reset(new FastHistMaker<GradStats, ValueConstraint>());
-      } else {
-        inner_.reset(new FastHistMaker<GradStats, NoConstraint>());
-      }
-    }
-
-    inner_->Init(args);
-  }
-
-  void Update(HostDeviceVector<GradientPair>* gpair,
-              DMatrix* data,
-              const std::vector<RegTree*>& trees) override {
-    CHECK(inner_ != nullptr);
-    inner_->Update(gpair, data, trees);
-  }
-
- private:
-  //  monotone constraints
-  bool monotone_{false};
-  // internal implementation
-  std::unique_ptr<TreeUpdater> inner_;
-};
-
 XGBOOST_REGISTER_TREE_UPDATER(FastHistMaker, "grow_fast_histmaker")
 .describe("Grow tree using quantized histogram.")
 .set_body([]() {
-    return new FastHistTreeUpdaterSwitch();
+    return new FastHistMaker();
   });
 
 }  // namespace tree
